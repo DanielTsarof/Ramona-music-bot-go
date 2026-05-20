@@ -12,79 +12,152 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/voice"
+	"github.com/disgoorg/snowflake/v2"
 )
 
 type Track struct {
-	Input string // local path or URL
+	Input string // local path or direct stream URL
 	IsURL bool
 	Title string
 }
 
 type Player struct {
-	s       *discordgo.Session
-	guildID string
+	client  *bot.Client
+	guildID snowflake.ID
 
 	mu            sync.Mutex
-	vc            *discordgo.VoiceConnection
+	conn          voice.Conn
 	currentCancel context.CancelFunc
+	currentTrack  *Track
 
-	queue    chan Track
+	queue    []Track
+	notifyCh chan struct{}
+	maxSize  int
+
 	resumeCh chan struct{}
 	paused   atomic.Bool
 }
 
-func NewPlayer(s *discordgo.Session, guildID string, queueSize int) *Player {
-	if queueSize <= 0 {
-		queueSize = 32
+func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int) *Player {
+	if maxSize <= 0 {
+		maxSize = 50
 	}
 	return &Player{
-		s:        s,
+		client:   client,
 		guildID:  guildID,
-		queue:    make(chan Track, queueSize),
+		notifyCh: make(chan struct{}, 1),
+		maxSize:  maxSize,
 		resumeCh: make(chan struct{}, 1),
 	}
 }
 
-func (p *Player) Join(channelID string) error {
-	vc, err := p.s.ChannelVoiceJoin(p.guildID, channelID, false, true)
-	if err != nil {
+func (p *Player) Join(channelID snowflake.ID) error {
+	p.mu.Lock()
+	conn := p.client.VoiceManager.GetConn(p.guildID)
+	if conn == nil {
+		conn = p.client.VoiceManager.CreateConn(p.guildID)
+	}
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := conn.Open(ctx, channelID, false, false); err != nil {
 		return fmt.Errorf("voice join: %w", err)
 	}
 
 	p.mu.Lock()
-	old := p.vc
-	p.vc = vc
+	p.conn = conn
 	p.mu.Unlock()
 
-	if old != nil && old != vc && old.ChannelID != channelID {
-		_ = old.Disconnect()
-	}
-
-	// По аналогии с официальным airhorn example — небольшой буфер до playback.
+	// Small buffer before playback.
 	time.Sleep(250 * time.Millisecond)
 	return nil
+}
+
+func (p *Player) Connected() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn != nil
 }
 
 func (p *Player) Disconnect() error {
 	p.Stop()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.vc == nil {
+	conn := p.conn
+	p.conn = nil
+	p.mu.Unlock()
+
+	if conn == nil {
 		return nil
 	}
-	err := p.vc.Disconnect()
-	p.vc = nil
-	return err
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn.Close(ctx)
+	p.client.VoiceManager.RemoveConn(p.guildID)
+	return nil
 }
 
 func (p *Player) Enqueue(t Track) error {
-	select {
-	case p.queue <- t:
-		return nil
-	default:
+	p.mu.Lock()
+	if len(p.queue) >= p.maxSize {
+		p.mu.Unlock()
 		return errors.New("queue is full")
 	}
+	p.queue = append(p.queue, t)
+	p.mu.Unlock()
+
+	select {
+	case p.notifyCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (p *Player) dequeue() (Track, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.queue) == 0 {
+		return Track{}, false
+	}
+	t := p.queue[0]
+	p.queue = p.queue[1:]
+	return t, true
+}
+
+func (p *Player) ClearQueue() {
+	p.mu.Lock()
+	p.queue = nil
+	p.mu.Unlock()
+}
+
+func (p *Player) GetQueue() []Track {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.queue) == 0 {
+		return nil
+	}
+	out := make([]Track, len(p.queue))
+	copy(out, p.queue)
+	return out
+}
+
+func (p *Player) NowPlaying() *Track {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.currentTrack == nil {
+		return nil
+	}
+	cp := *p.currentTrack
+	return &cp
+}
+
+func (p *Player) IsPlaying() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.currentTrack != nil
 }
 
 func (p *Player) Pause() {
@@ -100,7 +173,18 @@ func (p *Player) Resume() {
 	}
 }
 
+// Skip cancels the current track; Run() will pick up the next one.
+func (p *Player) Skip() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.currentCancel != nil {
+		p.currentCancel()
+	}
+}
+
+// Stop clears the queue and cancels the current track.
 func (p *Player) Stop() {
+	p.ClearQueue()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.currentCancel != nil {
@@ -111,34 +195,41 @@ func (p *Player) Stop() {
 
 func (p *Player) Run(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case tr := <-p.queue:
-			if err := p.playTrack(ctx, tr); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("playback error: %v", err)
+		tr, ok := p.dequeue()
+		if !ok {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.notifyCh:
+				continue
 			}
+		}
+		if err := p.playTrack(ctx, tr); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("playback error: %v", err)
 		}
 	}
 }
 
 func (p *Player) playTrack(parent context.Context, tr Track) error {
 	p.mu.Lock()
-	vc := p.vc
+	conn := p.conn
 	p.mu.Unlock()
 
-	if vc == nil {
+	if conn == nil {
 		return errors.New("not connected to voice")
 	}
 
 	ctx, cancel := context.WithCancel(parent)
 	p.mu.Lock()
 	p.currentCancel = cancel
+	cp := tr
+	p.currentTrack = &cp
 	p.mu.Unlock()
 	defer func() {
 		cancel()
 		p.mu.Lock()
 		p.currentCancel = nil
+		p.currentTrack = nil
 		p.mu.Unlock()
 	}()
 
@@ -148,15 +239,20 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 	}
 	defer stdout.Close()
 
-	if err := vc.Speaking(true); err != nil {
+	if err := conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return fmt.Errorf("speaking(true): %w", err)
+		return fmt.Errorf("SetSpeaking: %w", err)
 	}
 	defer func() {
-		_ = vc.Speaking(false)
+		// Use a fresh context — the track context may already be cancelled.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		_ = conn.SetSpeaking(stopCtx, voice.SpeakingFlagNone)
 		time.Sleep(250 * time.Millisecond)
 	}()
+
+	lastFrameSent := time.Now().UnixMilli()
 
 	streamErr := streamOggOpus(ctx, stdout, func(pkt []byte) error {
 		for p.paused.Load() {
@@ -166,13 +262,22 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 			case <-p.resumeCh:
 			}
 		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case vc.OpusSend <- pkt:
-			return nil
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+
+		sleepTime := time.Duration(20-(time.Now().UnixMilli()-lastFrameSent)) * time.Millisecond
+		if sleepTime > 0 {
+			time.Sleep(sleepTime)
+		}
+		if time.Now().UnixMilli() < lastFrameSent+60 {
+			lastFrameSent += 20
+		} else {
+			lastFrameSent = time.Now().UnixMilli()
+		}
+
+		_, err := conn.UDP().Write(pkt)
+		return err
 	})
 
 	if streamErr != nil {
@@ -182,7 +287,7 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 	waitErr := cmd.Wait()
 
 	if streamErr != nil {
-		if stderr.Len() > 0 {
+		if stderr.Len() > 0 && !errors.Is(streamErr, context.Canceled) {
 			return fmt.Errorf("stream error: %w | ffmpeg: %s", streamErr, stderr.String())
 		}
 		return streamErr
@@ -287,12 +392,12 @@ func streamOggOpus(ctx context.Context, r io.Reader, onPacket func([]byte) error
 			continued.Write(payload[offset : offset+n])
 			offset += n
 
-			// seg < 255 means end of packet
+			// seg < 255 marks the end of a packet.
 			if seg < 255 {
 				pkt := append([]byte(nil), continued.Bytes()...)
 				continued.Reset()
 
-				// Skip Opus metadata packets
+				// Skip Opus metadata packets.
 				if bytes.HasPrefix(pkt, []byte("OpusHead")) || bytes.HasPrefix(pkt, []byte("OpusTags")) {
 					continue
 				}

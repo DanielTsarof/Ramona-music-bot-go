@@ -1,3 +1,4 @@
 .idea
 .env
 *.mp3
+*.json
