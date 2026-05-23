@@ -29,6 +29,7 @@ type Player struct {
 
 	mu            sync.Mutex
 	conn          voice.Conn
+	channelID     snowflake.ID // stored for reconnect
 	currentCancel context.CancelFunc
 	currentTrack  *Track
 
@@ -54,25 +55,57 @@ func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int) *Player {
 }
 
 func (p *Player) Join(channelID snowflake.ID) error {
-	p.mu.Lock()
-	conn := p.client.VoiceManager.GetConn(p.guildID)
-	if conn == nil {
-		conn = p.client.VoiceManager.CreateConn(p.guildID)
+	// Discard any stale conn (e.g. from a previous failed Open).
+	if p.client.VoiceManager.GetConn(p.guildID) != nil {
+		p.client.VoiceManager.RemoveConn(p.guildID)
 	}
-	p.mu.Unlock()
+	conn := p.client.VoiceManager.CreateConn(p.guildID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// conn.Open blocks until the full DAVE MLS handshake completes, which can
+	// take 20-30 s. The UDP layer is established well before that and is all we
+	// need to start sending audio. Run Open in a background goroutine and return
+	// as soon as conn.UDP() is non-nil; DAVE finishes on its own after that.
+	openCtx, openCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	openErrCh := make(chan error, 1)
+	go func() {
+		openErrCh <- conn.Open(openCtx, channelID, false, false)
+		openCancel()
+	}()
 
-	if err := conn.Open(ctx, channelID, false, false); err != nil {
-		return fmt.Errorf("voice join: %w", err)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	// If UDP isn't up within 15 s something is genuinely wrong.
+	hardDeadline := time.NewTimer(15 * time.Second)
+	defer hardDeadline.Stop()
+
+	var openErr error
+	ready := false
+	for !ready {
+		select {
+		case err := <-openErrCh:
+			// Open finished (success = DAVE done; error = failed before UDP).
+			openErr = err
+			ready = true
+		case <-ticker.C:
+			// UDP layer is up; DAVE may still be negotiating in the background.
+			ready = conn.UDP() != nil
+		case <-hardDeadline.C:
+			openCancel()
+			p.client.VoiceManager.RemoveConn(p.guildID)
+			return fmt.Errorf("voice join: timed out waiting for UDP connection")
+		}
+	}
+
+	if openErr != nil {
+		p.client.VoiceManager.RemoveConn(p.guildID)
+		return fmt.Errorf("voice join: %w", openErr)
 	}
 
 	p.mu.Lock()
 	p.conn = conn
+	p.channelID = channelID
 	p.mu.Unlock()
 
-	// Small buffer before playback.
 	time.Sleep(250 * time.Millisecond)
 	return nil
 }
@@ -88,6 +121,7 @@ func (p *Player) Disconnect() error {
 	p.mu.Lock()
 	conn := p.conn
 	p.conn = nil
+	p.channelID = 0
 	p.mu.Unlock()
 
 	if conn == nil {
@@ -233,16 +267,28 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		p.mu.Unlock()
 	}()
 
-	cmd, stdout, stderr, err := startFFmpeg(ctx, tr)
-	if err != nil {
-		return err
+	// After Join returns (UDP up), the voice session_description exchange may
+	// still be in progress. SetSpeaking fails with "shard is not ready" until it
+	// completes. Retry for up to 10 s before starting FFmpeg.
+	var speakErr error
+	for attempt := 0; attempt < 60; attempt++ {
+		speakErr = conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone)
+		if speakErr == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	defer stdout.Close()
-
-	if err := conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fmt.Errorf("SetSpeaking: %w", err)
+	if speakErr != nil {
+		p.mu.Lock()
+		if p.conn == conn {
+			p.conn = nil
+		}
+		p.mu.Unlock()
+		return fmt.Errorf("SetSpeaking: %w", speakErr)
 	}
 	defer func() {
 		// Use a fresh context — the track context may already be cancelled.
@@ -252,18 +298,53 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		time.Sleep(250 * time.Millisecond)
 	}()
 
+	cmd, stdout, stderr, err := startFFmpeg(ctx, tr)
+	if err != nil {
+		return err
+	}
+	defer stdout.Close()
+
+	// Buffer 2 seconds of decoded frames so that brief source hiccups
+	// do not immediately cause a Discord underrun.
+	const bufferFrames = 100 // 100 × 20 ms = 2 s
+	frameCh := make(chan []byte, bufferFrames)
+
+	// Reader goroutine: FFmpeg stdout → frameCh.
+	readErrCh := make(chan error, 1)
+	go func() {
+		defer close(frameCh)
+		readErrCh <- streamOggOpus(ctx, stdout, func(pkt []byte) error {
+			select {
+			case frameCh <- append([]byte(nil), pkt...):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+
+	// Sender: frameCh → Discord UDP with 20 ms pacing.
+	var sendErr error
 	lastFrameSent := time.Now().UnixMilli()
 
-	streamErr := streamOggOpus(ctx, stdout, func(pkt []byte) error {
+SENDLOOP:
+	for pkt := range frameCh {
 		for p.paused.Load() {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				sendErr = ctx.Err()
+				break SENDLOOP
 			case <-p.resumeCh:
+				// Reset timing so we don't burst the buffered frames.
+				lastFrameSent = time.Now().UnixMilli()
 			}
 		}
+		if sendErr != nil {
+			break
+		}
 		if err := ctx.Err(); err != nil {
-			return err
+			sendErr = err
+			break
 		}
 
 		sleepTime := time.Duration(20-(time.Now().UnixMilli()-lastFrameSent)) * time.Millisecond
@@ -276,16 +357,30 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 			lastFrameSent = time.Now().UnixMilli()
 		}
 
-		_, err := conn.UDP().Write(pkt)
-		return err
-	})
+		if err := p.sendWithReconnect(ctx, pkt); err != nil {
+			sendErr = err
+			break
+		}
+	}
 
+	// Unblock the reader goroutine if the sender exited early.
+	if sendErr != nil {
+		cancel()
+	}
+	streamErr := <-readErrCh
+
+	if sendErr != nil {
+		_ = cmd.Process.Kill()
+	}
 	if streamErr != nil {
 		_ = cmd.Process.Kill()
 	}
 
 	waitErr := cmd.Wait()
 
+	if sendErr != nil {
+		return sendErr
+	}
 	if streamErr != nil {
 		if stderr.Len() > 0 && !errors.Is(streamErr, context.Canceled) {
 			return fmt.Errorf("stream error: %w | ffmpeg: %s", streamErr, stderr.String())
@@ -300,6 +395,96 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 	}
 
 	return nil
+}
+
+// safeUDPWrite wraps conn.UDP().Write to recover from the nil-pointer panic
+// that disgo raises when the internal UDP socket was closed by a 4006
+// gateway error (udpConnImpl stores a non-nil struct but a nil net.PacketConn).
+func safeUDPWrite(conn voice.Conn, pkt []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("udp write panicked (nil socket): %v", r)
+		}
+	}()
+	_, err = conn.UDP().Write(pkt)
+	return err
+}
+
+const voiceReconnectAttempts = 3
+
+// sendWithReconnect sends pkt to Discord; on failure it performs a full
+// session recreate (Join) up to voiceReconnectAttempts times. Using
+// conn.Open() on the existing conn is not sufficient after a 4006 "Session is
+// no longer valid" — a brand-new conn must be created each attempt.
+// On final failure p.conn is left nil so the next /play triggers a fresh join.
+func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
+	p.mu.Lock()
+	conn := p.conn
+	channelID := p.channelID
+	p.mu.Unlock()
+
+	if err := safeUDPWrite(conn, pkt); err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	log.Println("voice write error, attempting full reconnect...")
+
+	// Null out p.conn immediately. If all attempts fail it stays nil, so
+	// p.Connected() returns false and the next /play triggers a clean join.
+	p.mu.Lock()
+	p.conn = nil
+	p.mu.Unlock()
+
+	for i := 1; i <= voiceReconnectAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := p.Join(channelID); err != nil {
+			log.Printf("voice reconnect attempt %d/%d: %v", i, voiceReconnectAttempts, err)
+		} else {
+			p.mu.Lock()
+			conn = p.conn
+			p.mu.Unlock()
+
+			// Re-announce speaking on the fresh connection.
+			for j := 0; j < 10; j++ {
+				if conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone) == nil {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+
+			if err := safeUDPWrite(conn, pkt); err == nil {
+				log.Printf("voice reconnected (attempt %d/%d)", i, voiceReconnectAttempts)
+				return nil
+			}
+
+			// Write still failing; discard this session before the next attempt.
+			p.mu.Lock()
+			p.conn = nil
+			p.mu.Unlock()
+		}
+
+		if i < voiceReconnectAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+
+	return fmt.Errorf("voice reconnect failed after %d attempts", voiceReconnectAttempts)
 }
 
 func startFFmpeg(ctx context.Context, tr Track) (*exec.Cmd, io.ReadCloser, *bytes.Buffer, error) {
@@ -394,7 +579,7 @@ func streamOggOpus(ctx context.Context, r io.Reader, onPacket func([]byte) error
 
 			// seg < 255 marks the end of a packet.
 			if seg < 255 {
-				pkt := append([]byte(nil), continued.Bytes()...)
+				pkt := continued.Bytes()
 				continued.Reset()
 
 				// Skip Opus metadata packets.

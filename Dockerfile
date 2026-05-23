@@ -1,8 +1,15 @@
-FROM golang:1.25-bookworm AS builder
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc pkg-config curl unzip ca-certificates \
+        g++-14 pkg-config curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.25.1
+RUN curl -fsSL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH
+ENV GOPATH=/go
 
 # Install libdave headers + shared lib from prebuilt GitHub release
 RUN curl -fsSL \
@@ -13,23 +20,27 @@ RUN curl -fsSL \
     && rm /tmp/libdave.zip
 
 # Minimal pkg-config descriptor so `#cgo pkg-config: dave` resolves
-RUN printf 'prefix=/usr/local\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\
-Name: dave\nVersion: 1.1.0\n\
-Libs: -L${libdir} -ldave -Wl,-rpath,${libdir}\nCflags: -I${includedir}\n' \
-    > /usr/local/lib/pkgconfig/dave.pc
+RUN mkdir -p /usr/share/pkgconfig \
+    && printf 'Name: dave\nDescription: libdave E2EE\nVersion: 1.1.0\nCflags: -I/usr/local/include\nLibs: -L/usr/local/lib -ldave -Wl,-rpath,/usr/local/lib\n' \
+        > /usr/share/pkgconfig/dave.pc \
+    && pkg-config --cflags dave
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 go build -o /bin/ramona ./internal/bot/
+RUN CGO_ENABLED=1 CC=gcc-14 go build -o /bin/ramona ./internal/bot/
 
 # ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+# g++-14 is installed solely to pull in libstdc++6 >= 14 (GLIBCXX_3.4.32)
+# which libdave.so requires at runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates \
+        ffmpeg ca-certificates g++-14 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/libdave.so /usr/local/lib/

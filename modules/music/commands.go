@@ -93,23 +93,26 @@ func (m *MusicModule) handlePlay(e *events.ApplicationCommandInteractionCreate) 
 		return
 	}
 
-	streamURL, title, err := youtube.Resolve(context.Background(), query)
-	if err != nil {
-		editResponse(e, fmt.Sprintf("Could not resolve track: %v", err))
-		return
-	}
-
 	guildID, ok := guildIDOf(e)
 	if !ok {
 		return
 	}
 	p := m.getOrCreatePlayer(guildID)
 
+	// Join before resolving: DAVE's MLS handshake is CPU-intensive; running
+	// yt-dlp concurrently steals cycles and can push the handshake past its
+	// timeout. Resolve after the connection is established.
 	if !p.Connected() {
 		if err := p.Join(channelID); err != nil {
 			editResponse(e, fmt.Sprintf("Could not join voice channel: %v", err))
 			return
 		}
+	}
+
+	streamURL, title, err := youtube.Resolve(context.Background(), query)
+	if err != nil {
+		editResponse(e, fmt.Sprintf("Could not resolve track: %v", err))
+		return
 	}
 
 	if err := p.Enqueue(Track{Input: streamURL, IsURL: true, Title: title}); err != nil {
