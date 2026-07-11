@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"RamonaGo/internal/config"
 	"RamonaGo/modules/common"
@@ -22,9 +23,16 @@ import (
 )
 
 func main() {
-	if _, err := ytdlp.Install(context.Background(), nil); err != nil {
+	// AllowVersionMismatch: go-ytdlp pins an old yt-dlp release; we self-update
+	// the cached binary below, and the next startup must not clobber it back.
+	if _, err := ytdlp.Install(context.Background(), &ytdlp.InstallOptions{AllowVersionMismatch: true}); err != nil {
 		log.Fatalf("yt-dlp install: %v", err)
 	}
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if _, err := ytdlp.New().UpdateTo(updateCtx, "stable@latest"); err != nil {
+		log.Printf("WARN yt-dlp self-update failed (continuing with cached binary): %v", err)
+	}
+	updateCancel()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -56,6 +64,9 @@ func main() {
 		),
 		bot.WithVoiceManagerConfigOpts(
 			voice.WithDaveSessionCreateFunc(golibdave.NewSession),
+		),
+		bot.WithEventManagerConfigOpts(
+			bot.WithAsyncEventsEnabled(),
 		),
 	)
 	if err != nil {

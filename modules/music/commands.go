@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"RamonaGo/modules/music/youtube"
 	"github.com/disgoorg/disgo/discord"
@@ -102,20 +103,27 @@ func (m *MusicModule) handlePlay(e *events.ApplicationCommandInteractionCreate) 
 	// Join before resolving: DAVE's MLS handshake is CPU-intensive; running
 	// yt-dlp concurrently steals cycles and can push the handshake past its
 	// timeout. Resolve after the connection is established.
+	// Connected() (not a VoiceManager check): if a reconnect is in flight,
+	// Join blocks on joinMu and then reuses the fresh conn, whereas skipping
+	// Join with p.conn still nil would drop the track in playTrack.
 	if !p.Connected() {
+		editResponse(e, "Connecting to voice… (first join can take ~30s)")
 		if err := p.Join(channelID); err != nil {
 			editResponse(e, fmt.Sprintf("Could not join voice channel: %v", err))
 			return
 		}
 	}
 
-	streamURL, title, err := youtube.Resolve(context.Background(), query)
+	editResponse(e, fmt.Sprintf("Searching: **%s**…", query))
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer resolveCancel()
+	streamURL, title, err := youtube.Resolve(resolveCtx, query)
 	if err != nil {
 		editResponse(e, fmt.Sprintf("Could not resolve track: %v", err))
 		return
 	}
 
-	if err := p.Enqueue(Track{Input: streamURL, IsURL: true, Title: title}); err != nil {
+	if err := p.Enqueue(Track{Input: streamURL, IsURL: true, Title: title, Query: query, ChannelID: e.Channel().ID()}); err != nil {
 		editResponse(e, fmt.Sprintf("Queue error: %v", err))
 		return
 	}
@@ -187,6 +195,9 @@ func (m *MusicModule) handleJoin(e *events.ApplicationCommandInteractionCreate) 
 	}
 
 	p := m.getOrCreatePlayer(guildID)
+	if !p.Connected() {
+		editResponse(e, "Connecting to voice… (first join can take ~30s)")
+	}
 	if err := p.Join(channelID); err != nil {
 		editResponse(e, fmt.Sprintf("Could not join: %v", err))
 		return

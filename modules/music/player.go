@@ -12,15 +12,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"RamonaGo/modules/music/youtube"
 	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/voice"
 	"github.com/disgoorg/snowflake/v2"
 )
 
 type Track struct {
-	Input string // local path or direct stream URL
-	IsURL bool
-	Title string
+	Input     string // local path or direct stream URL
+	IsURL     bool
+	Title     string
+	Query     string       // original user query/URL — used to re-resolve a stale stream URL
+	ChannelID snowflake.ID // text channel to report playback errors to (0 = log only)
 }
 
 type Player struct {
@@ -28,6 +32,7 @@ type Player struct {
 	guildID snowflake.ID
 
 	mu            sync.Mutex
+	joinMu        sync.Mutex // serializes concurrent Join() calls
 	conn          voice.Conn
 	channelID     snowflake.ID // stored for reconnect
 	currentCancel context.CancelFunc
@@ -55,58 +60,67 @@ func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int) *Player {
 }
 
 func (p *Player) Join(channelID snowflake.ID) error {
-	// Discard any stale conn (e.g. from a previous failed Open).
-	if p.client.VoiceManager.GetConn(p.guildID) != nil {
+	p.joinMu.Lock()
+	defer p.joinMu.Unlock()
+
+	// If VoiceManager already has a Ready conn, reuse it instead of reconnecting.
+	// This handles the case where sendWithReconnect just finished a successful join
+	// and a concurrent handlePlay call arrives.
+	if existing := p.client.VoiceManager.GetConn(p.guildID); existing != nil {
+		if existing.Gateway().Status() == voice.StatusReady {
+			p.mu.Lock()
+			p.conn = existing
+			p.channelID = channelID
+			p.mu.Unlock()
+			return nil
+		}
 		p.client.VoiceManager.RemoveConn(p.guildID)
 	}
-	conn := p.client.VoiceManager.CreateConn(p.guildID)
 
-	// conn.Open blocks until the full DAVE MLS handshake completes, which can
-	// take 20-30 s. The UDP layer is established well before that and is all we
-	// need to start sending audio. Run Open in a background goroutine and return
-	// as soon as conn.UDP() is non-nil; DAVE finishes on its own after that.
-	openCtx, openCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	openErrCh := make(chan error, 1)
-	go func() {
-		openErrCh <- conn.Open(openCtx, channelID, false, false)
-		openCancel()
-	}()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	// If UDP isn't up within 15 s something is genuinely wrong.
-	hardDeadline := time.NewTimer(15 * time.Second)
-	defer hardDeadline.Stop()
-
+	// The first DAVE/MLS handshake tends to stall (not merely run slow) while a
+	// fresh attempt right after succeeds quickly — so cut the first attempt
+	// short and give the retry the full window.
+	timeouts := []time.Duration{30 * time.Second, 60 * time.Second}
 	var openErr error
-	ready := false
-	for !ready {
-		select {
-		case err := <-openErrCh:
-			// Open finished (success = DAVE done; error = failed before UDP).
-			openErr = err
-			ready = true
-		case <-ticker.C:
-			// UDP layer is up; DAVE may still be negotiating in the background.
-			ready = conn.UDP() != nil
-		case <-hardDeadline.C:
-			openCancel()
-			p.client.VoiceManager.RemoveConn(p.guildID)
-			return fmt.Errorf("voice join: timed out waiting for UDP connection")
+	for attempt, timeout := range timeouts {
+		if openErr = p.openConn(channelID, timeout); openErr == nil {
+			return nil
+		}
+		log.Printf("voice join attempt %d/%d: %v", attempt+1, len(timeouts), openErr)
+		if attempt < len(timeouts)-1 {
+			time.Sleep(time.Second)
 		}
 	}
+	return fmt.Errorf("voice join: %w", openErr)
+}
 
-	if openErr != nil {
+// openConn creates a fresh voice conn and blocks until it is fully open.
+//
+// conn.Open blocks until SessionDescription is received (after the full DAVE
+// MLS handshake). Waiting for it is the only way to guarantee that u.conn
+// (set by udp.Open on OpcodeReady) and u.encrypter (set by SetSecretKey on
+// SessionDescription) are both non-nil before we attempt any UDP writes.
+// Polling StatusReady is insufficient: the gateway sets that flag one step
+// before udp.Open runs, so returning early causes nil-pointer panics in
+// safeUDPWrite → sendWithReconnect cascade. DAVE normally takes 20–30 s.
+func (p *Player) openConn(channelID snowflake.ID, timeout time.Duration) error {
+	conn := p.client.VoiceManager.CreateConn(p.guildID)
+
+	openCtx, openCancel := context.WithTimeout(context.Background(), timeout)
+	defer openCancel()
+
+	if err := conn.Open(openCtx, channelID, false, false); err != nil {
+		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer leaveCancel()
+		safeConnClose(conn, leaveCtx)
 		p.client.VoiceManager.RemoveConn(p.guildID)
-		return fmt.Errorf("voice join: %w", openErr)
+		return err
 	}
 
 	p.mu.Lock()
 	p.conn = conn
 	p.channelID = channelID
 	p.mu.Unlock()
-
-	time.Sleep(250 * time.Millisecond)
 	return nil
 }
 
@@ -124,13 +138,18 @@ func (p *Player) Disconnect() error {
 	p.channelID = 0
 	p.mu.Unlock()
 
-	if conn == nil {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn.Close(ctx)
-	p.client.VoiceManager.RemoveConn(p.guildID)
+
+	if conn != nil {
+		safeConnClose(conn, ctx) // sends VoiceStateUpdate(leave); removeConnFunc cleans VoiceManager
+		return nil
+	}
+	// p.conn was nil (e.g. Join timed out before setting it, or sendWithReconnect cleared it).
+	// Check VoiceManager for a stale conn so we still leave the channel.
+	if existing := p.client.VoiceManager.GetConn(p.guildID); existing != nil {
+		safeConnClose(existing, ctx)
+	}
 	return nil
 }
 
@@ -239,9 +258,42 @@ func (p *Player) Run(ctx context.Context) {
 			}
 		}
 		if err := p.playTrack(ctx, tr); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("playback error: %v", err)
+			log.Printf("playback error [%s]: %v", tr.Title, err)
+			p.notifyPlaybackError(tr, err)
 		}
 	}
+}
+
+// notifyPlaybackError posts the error to the text channel the track was
+// queued from, so the user isn't left with a silent "Queued: …" message.
+func (p *Player) notifyPlaybackError(tr Track, playErr error) {
+	if tr.ChannelID == 0 {
+		return
+	}
+	msg := fmt.Sprintf("⚠ Playback error for **%s**: %v", tr.Title, playErr)
+	if len(msg) > 2000 {
+		msg = msg[:2000]
+	}
+	if _, err := p.client.Rest.CreateMessage(tr.ChannelID, discord.MessageCreate{Content: msg}); err != nil {
+		log.Printf("notify playback error: %v", err)
+	}
+}
+
+// announceSpeaking sends SetSpeaking with retries; the conn is fully open by
+// the time this is called, so failures should be rare and transient.
+func announceSpeaking(ctx context.Context, conn voice.Conn) error {
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		if err = conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return err
 }
 
 func (p *Player) playTrack(parent context.Context, tr Track) error {
@@ -267,22 +319,12 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		p.mu.Unlock()
 	}()
 
-	// After Join returns (UDP up), the voice session_description exchange may
-	// still be in progress. SetSpeaking fails with "shard is not ready" until it
-	// completes. Retry for up to 10 s before starting FFmpeg.
-	var speakErr error
-	for attempt := 0; attempt < 60; attempt++ {
-		speakErr = conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone)
-		if speakErr == nil {
-			break
+	// Join returns only after conn.Open() completes (SessionDescription received),
+	// so SetSpeaking should succeed immediately. Retry as a safety net.
+	if speakErr := announceSpeaking(ctx, conn); speakErr != nil {
+		if errors.Is(speakErr, context.Canceled) {
+			return speakErr
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	if speakErr != nil {
 		p.mu.Lock()
 		if p.conn == conn {
 			p.conn = nil
@@ -298,20 +340,64 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		time.Sleep(250 * time.Millisecond)
 	}()
 
-	cmd, stdout, stderr, err := startFFmpeg(ctx, tr)
+	// Googlevideo URLs go stale (IP-locked, expiring) and the network can cut
+	// mid-track, so on a non-cancel failure re-resolve a fresh URL from the
+	// original query and resume from where playback stopped.
+	const maxRestarts = 2
+	input := tr.Input
+	var offset time.Duration
+	for restart := 0; ; restart++ {
+		played, err := p.streamOnce(ctx, conn, input, tr.IsURL, offset)
+		offset += played
+		if err == nil || errors.Is(err, context.Canceled) || restart >= maxRestarts {
+			return err
+		}
+		log.Printf("stream interrupted at %s [%s], restart %d/%d: %v",
+			offset.Round(time.Second), tr.Title, restart+1, maxRestarts, err)
+
+		if tr.Query != "" && tr.IsURL {
+			rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+			if freshURL, _, rerr := youtube.Resolve(rctx, tr.Query); rerr == nil {
+				input = freshURL
+			} else {
+				log.Printf("re-resolve failed, reusing old URL: %v", rerr)
+			}
+			rcancel()
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// streamOnce runs one ffmpeg pass over input (starting at offset) and streams
+// it to Discord. Returns how much audio was actually sent, so the caller can
+// resume from that position after a failure.
+func (p *Player) streamOnce(parent context.Context, conn voice.Conn, input string, isURL bool, offset time.Duration) (time.Duration, error) {
+	// Child context so an early sender exit unblocks the reader and kills
+	// ffmpeg without cancelling the whole track (playTrack may restart us).
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	cmd, stdout, stderr, err := startFFmpeg(ctx, input, isURL, offset)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer stdout.Close()
 
-	// Buffer 2 seconds of decoded frames so that brief source hiccups
+	// Buffer 5 seconds of decoded frames so that brief source hiccups
 	// do not immediately cause a Discord underrun.
-	const bufferFrames = 100 // 100 × 20 ms = 2 s
+	const bufferFrames = 250 // 250 × 20 ms = 5 s
 	frameCh := make(chan []byte, bufferFrames)
 
 	// Reader goroutine: FFmpeg stdout → frameCh.
 	readErrCh := make(chan error, 1)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		defer close(frameCh)
 		readErrCh <- streamOggOpus(ctx, stdout, func(pkt []byte) error {
 			select {
@@ -323,24 +409,44 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		})
 	}()
 
+	// Prebuffer ~2 s before the first frame goes out: a smooth start and a
+	// cushion against jitter right after ffmpeg spins up.
+	const prebufferFrames = 100
+	prebufferDeadline := time.After(2500 * time.Millisecond)
+PREBUFFER:
+	for len(frameCh) < prebufferFrames {
+		select {
+		case <-ctx.Done():
+			break PREBUFFER
+		case <-readerDone: // short track fully decoded
+			break PREBUFFER
+		case <-prebufferDeadline:
+			break PREBUFFER
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
 	// Sender: frameCh → Discord UDP with 20 ms pacing.
 	var sendErr error
+	framesSent := 0
 	lastFrameSent := time.Now().UnixMilli()
 
 SENDLOOP:
 	for pkt := range frameCh {
-		for p.paused.Load() {
-			select {
-			case <-ctx.Done():
-				sendErr = ctx.Err()
-				break SENDLOOP
-			case <-p.resumeCh:
-				// Reset timing so we don't burst the buffered frames.
-				lastFrameSent = time.Now().UnixMilli()
+		if p.paused.Load() {
+			// Silence frames let the receiving decoder settle instead of
+			// interpolating into a click.
+			p.sendSilence(conn)
+			for p.paused.Load() {
+				select {
+				case <-ctx.Done():
+					sendErr = ctx.Err()
+					break SENDLOOP
+				case <-p.resumeCh:
+					// Reset timing so we don't burst the buffered frames.
+					lastFrameSent = time.Now().UnixMilli()
+				}
 			}
-		}
-		if sendErr != nil {
-			break
 		}
 		if err := ctx.Err(); err != nil {
 			sendErr = err
@@ -361,7 +467,10 @@ SENDLOOP:
 			sendErr = err
 			break
 		}
+		framesSent++
 	}
+
+	played := time.Duration(framesSent) * 20 * time.Millisecond
 
 	// Unblock the reader goroutine if the sender exited early.
 	if sendErr != nil {
@@ -369,32 +478,41 @@ SENDLOOP:
 	}
 	streamErr := <-readErrCh
 
-	if sendErr != nil {
+	if sendErr != nil || streamErr != nil {
 		_ = cmd.Process.Kill()
 	}
-	if streamErr != nil {
-		_ = cmd.Process.Kill()
-	}
-
 	waitErr := cmd.Wait()
 
 	if sendErr != nil {
-		return sendErr
+		return played, sendErr
 	}
 	if streamErr != nil {
 		if stderr.Len() > 0 && !errors.Is(streamErr, context.Canceled) {
-			return fmt.Errorf("stream error: %w | ffmpeg: %s", streamErr, stderr.String())
+			return played, fmt.Errorf("stream error: %w | ffmpeg: %s", streamErr, stderr.String())
 		}
-		return streamErr
+		return played, streamErr
 	}
 	if waitErr != nil && !errors.Is(ctx.Err(), context.Canceled) {
 		if stderr.Len() > 0 {
-			return fmt.Errorf("ffmpeg wait: %w | ffmpeg: %s", waitErr, stderr.String())
+			return played, fmt.Errorf("ffmpeg wait: %w | ffmpeg: %s", waitErr, stderr.String())
 		}
-		return waitErr
+		return played, waitErr
 	}
 
-	return nil
+	// Clean end of stream: pad with silence so the decoder finishes cleanly.
+	p.sendSilence(conn)
+	return played, nil
+}
+
+// opusSilence is the Opus PLC silence frame; Discord expects ~5 of them after
+// audio stops so the jitter buffer/decoder drains without artifacts.
+var opusSilence = []byte{0xF8, 0xFF, 0xFE}
+
+func (p *Player) sendSilence(conn voice.Conn) {
+	for i := 0; i < 5; i++ {
+		_ = safeUDPWrite(conn, opusSilence)
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // safeUDPWrite wraps conn.UDP().Write to recover from the nil-pointer panic
@@ -408,6 +526,16 @@ func safeUDPWrite(conn voice.Conn, pkt []byte) (err error) {
 	}()
 	_, err = conn.UDP().Write(pkt)
 	return err
+}
+
+// safeConnClose calls conn.Close and recovers from the nil-pointer panic that
+// disgo raises in udpConnImpl.Close when the UDP socket was never opened (i.e.
+// the voice connection timed out before OpcodeReady triggered udp.Open).
+// The leave VoiceStateUpdate is always sent by the first line of conn.Close
+// (not deferred), so the bot exits the channel even when the panic fires.
+func safeConnClose(conn voice.Conn, ctx context.Context) {
+	defer func() { recover() }()
+	conn.Close(ctx)
 }
 
 const voiceReconnectAttempts = 3
@@ -453,15 +581,8 @@ func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 			p.mu.Unlock()
 
 			// Re-announce speaking on the fresh connection.
-			for j := 0; j < 10; j++ {
-				if conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone) == nil {
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(500 * time.Millisecond):
-				}
+			if err := announceSpeaking(ctx, conn); err != nil && ctx.Err() != nil {
+				return ctx.Err()
 			}
 
 			if err := safeUDPWrite(conn, pkt); err == nil {
@@ -484,26 +605,38 @@ func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 		}
 	}
 
+	// All attempts failed. Clean up VoiceManager so the next Join() creates a
+	// fresh conn rather than reusing this dead one.
+	p.client.VoiceManager.RemoveConn(p.guildID)
 	return fmt.Errorf("voice reconnect failed after %d attempts", voiceReconnectAttempts)
 }
 
-func startFFmpeg(ctx context.Context, tr Track) (*exec.Cmd, io.ReadCloser, *bytes.Buffer, error) {
+func startFFmpeg(ctx context.Context, input string, isURL bool, offset time.Duration) (*exec.Cmd, io.ReadCloser, *bytes.Buffer, error) {
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 	}
 
 	// Reconnect flags are useful mainly for URL sources.
-	if tr.IsURL {
+	if isURL {
 		args = append(args,
 			"-reconnect", "1",
 			"-reconnect_streamed", "1",
+			"-reconnect_on_network_error", "1",
+			"-reconnect_on_http_error", "4xx,5xx",
 			"-reconnect_delay_max", "5",
+			// Error out instead of hanging on a dead connection so the
+			// restart/re-resolve loop in playTrack can take over.
+			"-rw_timeout", "15000000", // 15 s, in µs
 		)
 	}
 
+	if offset > 0 {
+		args = append(args, "-ss", fmt.Sprintf("%.2f", offset.Seconds()))
+	}
+
 	args = append(args,
-		"-i", tr.Input,
+		"-i", input,
 		"-vn",
 		"-map", "0:a:0",
 		"-ac", "2",
