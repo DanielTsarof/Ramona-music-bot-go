@@ -44,18 +44,22 @@ type Player struct {
 
 	resumeCh chan struct{}
 	paused   atomic.Bool
+
+	idleTimeout time.Duration // 0 = never auto-leave on idle
+	lastTextCh  snowflake.ID  // last text channel a track was queued from
 }
 
-func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int) *Player {
+func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int, idleTimeout time.Duration) *Player {
 	if maxSize <= 0 {
 		maxSize = 50
 	}
 	return &Player{
-		client:   client,
-		guildID:  guildID,
-		notifyCh: make(chan struct{}, 1),
-		maxSize:  maxSize,
-		resumeCh: make(chan struct{}, 1),
+		client:      client,
+		guildID:     guildID,
+		notifyCh:    make(chan struct{}, 1),
+		maxSize:     maxSize,
+		resumeCh:    make(chan struct{}, 1),
+		idleTimeout: idleTimeout,
 	}
 }
 
@@ -128,6 +132,26 @@ func (p *Player) Connected() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.conn != nil
+}
+
+// VoiceChannelID returns the voice channel the player is connected to (0 if none).
+func (p *Player) VoiceChannelID() snowflake.ID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn == nil {
+		return 0
+	}
+	return p.channelID
+}
+
+// ResetVoiceState drops local voice state and clears the queue. Used when the
+// bot was removed from the channel externally (kick/move) and the conn is dead.
+func (p *Player) ResetVoiceState() {
+	p.Stop()
+	p.mu.Lock()
+	p.conn = nil
+	p.channelID = 0
+	p.mu.Unlock()
 }
 
 func (p *Player) Disconnect() error {
@@ -250,32 +274,53 @@ func (p *Player) Run(ctx context.Context) {
 	for {
 		tr, ok := p.dequeue()
 		if !ok {
+			// Arm the idle timer only while connected; a nil channel blocks forever.
+			var idleC <-chan time.Time
+			if p.idleTimeout > 0 && p.Connected() {
+				idleC = time.After(p.idleTimeout)
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-p.notifyCh:
 				continue
+			case <-idleC:
+				// A track may have been enqueued in the same instant the
+				// timer fired; don't disconnect under a freshly filled queue.
+				if len(p.GetQueue()) > 0 {
+					continue
+				}
+				log.Printf("guild %s: idle for %s, leaving voice", p.guildID, p.idleTimeout)
+				p.notify(p.textChannel(), fmt.Sprintf("Left voice channel: idle for %s.", p.idleTimeout))
+				if err := p.Disconnect(); err != nil {
+					log.Printf("idle disconnect: %v", err)
+				}
+				continue
 			}
 		}
 		if err := p.playTrack(ctx, tr); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("playback error [%s]: %v", tr.Title, err)
-			p.notifyPlaybackError(tr, err)
+			p.notify(tr.ChannelID, fmt.Sprintf("⚠ Playback error for **%s**: %v", tr.Title, err))
 		}
 	}
 }
 
-// notifyPlaybackError posts the error to the text channel the track was
-// queued from, so the user isn't left with a silent "Queued: …" message.
-func (p *Player) notifyPlaybackError(tr Track, playErr error) {
-	if tr.ChannelID == 0 {
+func (p *Player) textChannel() snowflake.ID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastTextCh
+}
+
+// notify posts msg to the given text channel; 0 or REST failures degrade to logs.
+func (p *Player) notify(channelID snowflake.ID, msg string) {
+	if channelID == 0 {
 		return
 	}
-	msg := fmt.Sprintf("⚠ Playback error for **%s**: %v", tr.Title, playErr)
 	if len(msg) > 2000 {
 		msg = msg[:2000]
 	}
-	if _, err := p.client.Rest.CreateMessage(tr.ChannelID, discord.MessageCreate{Content: msg}); err != nil {
-		log.Printf("notify playback error: %v", err)
+	if _, err := p.client.Rest.CreateMessage(channelID, discord.MessageCreate{Content: msg}); err != nil {
+		log.Printf("notify: %v", err)
 	}
 }
 
@@ -310,6 +355,9 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 	p.currentCancel = cancel
 	cp := tr
 	p.currentTrack = &cp
+	if tr.ChannelID != 0 {
+		p.lastTextCh = tr.ChannelID
+	}
 	p.mu.Unlock()
 	defer func() {
 		cancel()

@@ -10,6 +10,8 @@ type Config struct {
 	DiscordToken string `env:"DISCORD_TOKEN" env-required:"true"`
 	GuildID      string `env:"DISCORD_GUILD_ID"`
 	MaxQueueSize int    `env:"MAX_QUEUE_SIZE" env-default:"50"`
+	// IdleDisconnectSeconds: leave voice after this long with nothing playing (0 = never).
+	IdleDisconnectSeconds int `env:"IDLE_DISCONNECT_SECONDS" env-default:"300"`
 }
 
 func Load() (*Config, error) {
