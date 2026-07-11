@@ -9,11 +9,18 @@ import (
 	ytdlp "github.com/lrstanley/go-ytdlp"
 )
 
-// Resolve returns a direct audio stream URL and title for a YouTube URL or
-// plain-text search query. Non-URL queries are prefixed with "ytsearch1:".
-// Transient network failures (TLS resets under throttling) are retried once
-// on top of yt-dlp's own --retries.
-func Resolve(ctx context.Context, query string) (streamURL, title string, err error) {
+// Info describes a resolved track.
+type Info struct {
+	StreamURL  string
+	Title      string
+	WebpageURL string
+	Duration   int // seconds, 0 = unknown
+}
+
+// Resolve returns stream info for a YouTube URL or plain-text search query.
+// Non-URL queries are prefixed with "ytsearch1:". Transient network failures
+// (TLS resets under throttling) are retried once on top of yt-dlp's own --retries.
+func Resolve(ctx context.Context, query string) (Info, error) {
 	input := query
 	if !strings.HasPrefix(query, "http://") && !strings.HasPrefix(query, "https://") {
 		input = "ytsearch1:" + query
@@ -21,19 +28,19 @@ func Resolve(ctx context.Context, query string) (streamURL, title string, err er
 
 	const attempts = 2
 	for i := 1; ; i++ {
-		streamURL, title, err = resolveOnce(ctx, input)
+		info, err := resolveOnce(ctx, input)
 		if err == nil || i >= attempts || ctx.Err() != nil {
-			return streamURL, title, err
+			return info, err
 		}
 		select {
 		case <-ctx.Done():
-			return "", "", ctx.Err()
+			return Info{}, ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
 	}
 }
 
-func resolveOnce(ctx context.Context, input string) (streamURL, title string, err error) {
+func resolveOnce(ctx context.Context, input string) (Info, error) {
 	result, err := ytdlp.New().
 		NoPlaylist().
 		Format("bestaudio[ext=webm]/bestaudio/best").
@@ -45,30 +52,37 @@ func resolveOnce(ctx context.Context, input string) (streamURL, title string, er
 		DumpJSON().
 		Run(ctx, input)
 	if err != nil {
-		return "", "", fmt.Errorf("yt-dlp: %w", err)
+		return Info{}, fmt.Errorf("yt-dlp: %w", err)
 	}
 
 	infos, err := result.GetExtractedInfo()
 	if err != nil {
-		return "", "", fmt.Errorf("parse yt-dlp output: %w", err)
+		return Info{}, fmt.Errorf("parse yt-dlp output: %w", err)
 	}
 	if len(infos) == 0 {
-		return "", "", fmt.Errorf("yt-dlp returned no results")
+		return Info{}, fmt.Errorf("yt-dlp returned no results")
 	}
 
-	info := infos[0]
-
-	if info.Title != nil {
-		title = *info.Title
+	raw := infos[0]
+	out := Info{}
+	if raw.Title != nil {
+		out.Title = *raw.Title
+	}
+	if raw.WebpageURL != nil {
+		out.WebpageURL = *raw.WebpageURL
+	}
+	if raw.Duration != nil {
+		out.Duration = int(*raw.Duration)
 	}
 
-	// info.URL is the top-level selected-format URL; fall back to the embedded format.
-	if info.URL != nil && *info.URL != "" {
-		return *info.URL, title, nil
+	// raw.URL is the top-level selected-format URL; fall back to the embedded format.
+	switch {
+	case raw.URL != nil && *raw.URL != "":
+		out.StreamURL = *raw.URL
+	case raw.ExtractedFormat != nil && raw.ExtractedFormat.URL != "":
+		out.StreamURL = raw.ExtractedFormat.URL
+	default:
+		return Info{}, fmt.Errorf("yt-dlp returned no stream URL")
 	}
-	if info.ExtractedFormat != nil && info.ExtractedFormat.URL != "" {
-		return info.ExtractedFormat.URL, title, nil
-	}
-
-	return "", "", fmt.Errorf("yt-dlp returned no stream URL")
+	return out, nil
 }

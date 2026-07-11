@@ -118,18 +118,27 @@ func (m *MusicModule) handlePlay(e *events.ApplicationCommandInteractionCreate) 
 	editResponse(e, fmt.Sprintf("Searching: **%s**…", query))
 	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer resolveCancel()
-	streamURL, title, err := youtube.Resolve(resolveCtx, query)
+	res, err := youtube.Resolve(resolveCtx, query)
 	if err != nil {
 		editResponse(e, fmt.Sprintf("Could not resolve track: %v", err))
 		return
 	}
 
-	if err := p.Enqueue(Track{Input: streamURL, IsURL: true, Title: title, Query: query, ChannelID: e.Channel().ID()}); err != nil {
+	track := Track{
+		Input:      res.StreamURL,
+		IsURL:      true,
+		Title:      res.Title,
+		Query:      query,
+		ChannelID:  e.Channel().ID(),
+		WebpageURL: res.WebpageURL,
+		Duration:   res.Duration,
+	}
+	if err := p.Enqueue(track); err != nil {
 		editResponse(e, fmt.Sprintf("Queue error: %v", err))
 		return
 	}
 
-	editResponse(e, fmt.Sprintf("Queued: **%s**", title))
+	editResponse(e, fmt.Sprintf("Queued: **%s**", res.Title))
 }
 
 func (m *MusicModule) handlePause(e *events.ApplicationCommandInteractionCreate) {

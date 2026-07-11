@@ -2,7 +2,9 @@ package music
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +31,90 @@ func NewMusicModule(client *bot.Client, cfg *config.Config, ctx context.Context)
 		players: make(map[snowflake.ID]*Player),
 		ctx:     ctx,
 	}
-	client.AddEventListeners(bot.NewListenerFunc(m.onVoiceStateUpdate))
+	client.AddEventListeners(
+		bot.NewListenerFunc(m.onVoiceStateUpdate),
+		bot.NewListenerFunc(m.onComponentInteraction),
+	)
 	return m
+}
+
+// onComponentInteraction handles clicks on the player panel buttons.
+func (m *MusicModule) onComponentInteraction(e *events.ComponentInteractionCreate) {
+	data, ok := e.Data.(discord.ButtonInteractionData)
+	if !ok {
+		return
+	}
+	customID := data.CustomID()
+	if !strings.HasPrefix(customID, "player_") {
+		return
+	}
+	guildID := e.GuildID()
+	if guildID == nil {
+		return
+	}
+	p := m.getPlayer(*guildID)
+	if p == nil {
+		_ = e.CreateMessage(discord.MessageCreate{
+			Content: "Nothing is playing.",
+			Flags:   discord.MessageFlagEphemeral,
+		})
+		return
+	}
+
+	rerender := func() {
+		tr := p.NowPlaying()
+		buttons := playerButtons(p.IsPaused(), p.IsLooping(), tr == nil)
+		_ = e.UpdateMessage(discord.MessageUpdate{
+			Embeds:     &[]discord.Embed{playerEmbed(tr, p.IsPaused(), p.IsLooping())},
+			Components: &buttons,
+		})
+	}
+
+	switch customID {
+	case btnPauseResume:
+		if p.IsPaused() {
+			p.Resume()
+		} else {
+			p.Pause()
+		}
+		rerender()
+	case btnLoop:
+		p.ToggleLoop()
+		rerender()
+	case btnSkip:
+		p.Skip()
+		// The next track posts a fresh panel; nothing to edit here.
+		_ = e.DeferUpdateMessage()
+	case btnQueue:
+		var sb strings.Builder
+		if t := p.NowPlaying(); t != nil {
+			fmt.Fprintf(&sb, "▶ **%s**\n", t.Title)
+		}
+		tracks := p.GetQueue()
+		limit := len(tracks)
+		if limit > 10 {
+			limit = 10
+		}
+		for i, t := range tracks[:limit] {
+			fmt.Fprintf(&sb, "`%d.` %s\n", i+1, t.Title)
+		}
+		if len(tracks) > 10 {
+			fmt.Fprintf(&sb, "...and %d more", len(tracks)-10)
+		}
+		if sb.Len() == 0 {
+			sb.WriteString("Queue is empty.")
+		}
+		_ = e.CreateMessage(discord.MessageCreate{
+			Content: sb.String(),
+			Flags:   discord.MessageFlagEphemeral,
+		})
+	case btnStop:
+		p.Stop()
+		_ = e.UpdateMessage(discord.MessageUpdate{
+			Embeds:     &[]discord.Embed{stoppedEmbed()},
+			Components: &[]discord.LayoutComponent{},
+		})
+	}
 }
 
 func (m *MusicModule) getOrCreatePlayer(guildID snowflake.ID) *Player {

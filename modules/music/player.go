@@ -20,11 +20,13 @@ import (
 )
 
 type Track struct {
-	Input     string // local path or direct stream URL
-	IsURL     bool
-	Title     string
-	Query     string       // original user query/URL — used to re-resolve a stale stream URL
-	ChannelID snowflake.ID // text channel to report playback errors to (0 = log only)
+	Input      string // local path or direct stream URL
+	IsURL      bool
+	Title      string
+	Query      string       // original user query/URL — used to re-resolve a stale stream URL
+	ChannelID  snowflake.ID // text channel to report playback errors to (0 = log only)
+	WebpageURL string       // human-facing page URL (embed title link)
+	Duration   int          // seconds, 0 = unknown
 }
 
 type Player struct {
@@ -48,6 +50,9 @@ type Player struct {
 
 	idleTimeout time.Duration // 0 = never auto-leave on idle
 	lastTextCh  snowflake.ID  // last text channel a track was queued from
+
+	panelChannelID snowflake.ID // where the interactive player panel lives
+	panelMessageID snowflake.ID
 }
 
 func NewPlayer(client *bot.Client, guildID snowflake.ID, maxSize int, idleTimeout time.Duration) *Player {
@@ -265,6 +270,10 @@ func (p *Player) IsLooping() bool {
 	return p.looping.Load()
 }
 
+func (p *Player) IsPaused() bool {
+	return p.paused.Load()
+}
+
 // Skip cancels the current track; Run() will pick up the next one.
 func (p *Player) Skip() {
 	p.mu.Lock()
@@ -314,6 +323,7 @@ func (p *Player) Run(ctx context.Context) {
 				continue
 			}
 		}
+		p.postPanel(tr)
 		// Replay the same track while loop mode is on; skip/stop cancel the
 		// track context and break out, errors never replay.
 		for {
@@ -329,6 +339,9 @@ func (p *Player) Run(ctx context.Context) {
 				break
 			}
 		}
+		if len(p.GetQueue()) == 0 {
+			p.updatePanelIdle()
+		}
 	}
 }
 
@@ -336,6 +349,54 @@ func (p *Player) textChannel() snowflake.ID {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.lastTextCh
+}
+
+// postPanel replaces the interactive player panel: deletes the previous panel
+// message (if any) and posts a fresh one for tr in the track's text channel.
+func (p *Player) postPanel(tr Track) {
+	channelID := tr.ChannelID
+	if channelID == 0 {
+		channelID = p.textChannel()
+	}
+	if channelID == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	oldCh, oldMsg := p.panelChannelID, p.panelMessageID
+	p.mu.Unlock()
+	if oldMsg != 0 {
+		_ = p.client.Rest.DeleteMessage(oldCh, oldMsg)
+	}
+
+	msg, err := p.client.Rest.CreateMessage(channelID, discord.MessageCreate{
+		Embeds:     []discord.Embed{playerEmbed(&tr, p.IsPaused(), p.IsLooping())},
+		Components: playerButtons(p.IsPaused(), p.IsLooping(), false),
+	})
+	if err != nil {
+		log.Printf("post player panel: %v", err)
+		return
+	}
+	p.mu.Lock()
+	p.panelChannelID, p.panelMessageID = channelID, msg.ID
+	p.mu.Unlock()
+}
+
+// updatePanelIdle greys out the panel once the queue has drained.
+func (p *Player) updatePanelIdle() {
+	p.mu.Lock()
+	ch, msg := p.panelChannelID, p.panelMessageID
+	p.mu.Unlock()
+	if msg == 0 {
+		return
+	}
+	_, err := p.client.Rest.UpdateMessage(ch, msg, discord.MessageUpdate{
+		Embeds:     &[]discord.Embed{playerEmbed(nil, false, false)},
+		Components: &[]discord.LayoutComponent{},
+	})
+	if err != nil {
+		log.Printf("update player panel: %v", err)
+	}
 }
 
 // notify posts msg to the given text channel; 0 or REST failures degrade to logs.
@@ -432,8 +493,8 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 
 		if tr.Query != "" && tr.IsURL {
 			rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
-			if freshURL, _, rerr := youtube.Resolve(rctx, tr.Query); rerr == nil {
-				input = freshURL
+			if res, rerr := youtube.Resolve(rctx, tr.Query); rerr == nil {
+				input = res.StreamURL
 			} else {
 				log.Printf("re-resolve failed, reusing old URL: %v", rerr)
 			}
