@@ -1,5 +1,8 @@
 FROM ubuntu:24.04 AS builder
 
+# amd64 / arm64 — set automatically by BuildKit for the target platform
+ARG TARGETARCH
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -7,13 +10,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go 1.25.1
-RUN curl -fsSL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+RUN curl -fsSL "https://go.dev/dl/go1.25.1.linux-${TARGETARCH}.tar.gz" | tar -C /usr/local -xz
 ENV PATH=/usr/local/go/bin:$PATH
 ENV GOPATH=/go
 
-# Install libdave headers + shared lib from prebuilt GitHub release
-RUN curl -fsSL \
-        https://github.com/discord/libdave/releases/download/v1.1.0/cpp/libdave-Linux-X64-boringssl.zip \
+# Install libdave headers + shared lib from prebuilt GitHub release.
+# Release asset naming: amd64 → Linux-X64, arm64 → Linux-ARM64.
+RUN case "${TARGETARCH}" in \
+        amd64) DAVE_ARCH=X64 ;; \
+        arm64) DAVE_ARCH=ARM64 ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL \
+        "https://github.com/discord/libdave/releases/download/v1.1.0/cpp/libdave-Linux-${DAVE_ARCH}-boringssl.zip" \
         -o /tmp/libdave.zip \
     && unzip -j /tmp/libdave.zip "include/dave/dave.h" -d /usr/local/include/ \
     && unzip -j /tmp/libdave.zip "lib/libdave.so"      -d /usr/local/lib/ \

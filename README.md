@@ -47,6 +47,10 @@ docker compose up --build
 The yt-dlp binary is downloaded on first start and cached in the `ytdlp-cache`
 volume (it self-updates to the latest version on every startup).
 
+The image is multi-arch (`amd64`/`arm64`): it also builds and runs on a
+Raspberry Pi 4 with 64-bit Raspberry Pi OS — run the same command on the Pi.
+32-bit OS (armv7) is not supported (no libdave build for it).
+
 ## Stack
 
 - [disgo](https://github.com/disgoorg/disgo) — Discord API (gateway, voice, interactions)
