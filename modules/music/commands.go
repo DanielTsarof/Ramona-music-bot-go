@@ -28,6 +28,7 @@ var musicCommands = []discord.ApplicationCommandCreate{
 	discord.SlashCommandCreate{Name: "pause", Description: "Pause playback"},
 	discord.SlashCommandCreate{Name: "resume", Description: "Resume paused playback"},
 	discord.SlashCommandCreate{Name: "skip", Description: "Skip the current track"},
+	discord.SlashCommandCreate{Name: "loop", Description: "Toggle looping of the current track"},
 	discord.SlashCommandCreate{Name: "stop", Description: "Stop playback and clear the queue"},
 	discord.SlashCommandCreate{Name: "join", Description: "Join your voice channel"},
 	discord.SlashCommandCreate{Name: "leave", Description: "Leave the voice channel"},
@@ -169,6 +170,24 @@ func (m *MusicModule) handleSkip(e *events.ApplicationCommandInteractionCreate) 
 	respond(e, "Skipped.")
 }
 
+func (m *MusicModule) handleLoop(e *events.ApplicationCommandInteractionCreate) {
+	guildID, ok := guildIDOf(e)
+	if !ok {
+		return
+	}
+	p := m.getOrCreatePlayer(guildID)
+	t := p.NowPlaying()
+	if t == nil {
+		respondEphemeral(e, "Nothing is playing.")
+		return
+	}
+	if p.ToggleLoop() {
+		respond(e, fmt.Sprintf("🔁 Looping: **%s**", t.Title))
+	} else {
+		respond(e, "Looping disabled.")
+	}
+}
+
 func (m *MusicModule) handleStop(e *events.ApplicationCommandInteractionCreate) {
 	guildID, ok := guildIDOf(e)
 	if !ok {
@@ -256,5 +275,9 @@ func (m *MusicModule) handleNowPlaying(e *events.ApplicationCommandInteractionCr
 		respond(e, "Nothing is playing.")
 		return
 	}
-	respond(e, fmt.Sprintf("Now playing: **%s**", t.Title))
+	suffix := ""
+	if p.IsLooping() {
+		suffix = " (🔁 loop)"
+	}
+	respond(e, fmt.Sprintf("Now playing: **%s**%s", t.Title, suffix))
 }

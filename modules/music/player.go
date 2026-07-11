@@ -44,6 +44,7 @@ type Player struct {
 
 	resumeCh chan struct{}
 	paused   atomic.Bool
+	looping  atomic.Bool
 
 	idleTimeout time.Duration // 0 = never auto-leave on idle
 	lastTextCh  snowflake.ID  // last text channel a track was queued from
@@ -250,6 +251,20 @@ func (p *Player) Resume() {
 	}
 }
 
+// ToggleLoop flips loop mode and returns the new state.
+func (p *Player) ToggleLoop() bool {
+	for {
+		old := p.looping.Load()
+		if p.looping.CompareAndSwap(old, !old) {
+			return !old
+		}
+	}
+}
+
+func (p *Player) IsLooping() bool {
+	return p.looping.Load()
+}
+
 // Skip cancels the current track; Run() will pick up the next one.
 func (p *Player) Skip() {
 	p.mu.Lock()
@@ -259,9 +274,10 @@ func (p *Player) Skip() {
 	}
 }
 
-// Stop clears the queue and cancels the current track.
+// Stop clears the queue, disables looping and cancels the current track.
 func (p *Player) Stop() {
 	p.ClearQueue()
+	p.looping.Store(false)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.currentCancel != nil {
@@ -298,9 +314,20 @@ func (p *Player) Run(ctx context.Context) {
 				continue
 			}
 		}
-		if err := p.playTrack(ctx, tr); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("playback error [%s]: %v", tr.Title, err)
-			p.notify(tr.ChannelID, fmt.Sprintf("⚠ Playback error for **%s**: %v", tr.Title, err))
+		// Replay the same track while loop mode is on; skip/stop cancel the
+		// track context and break out, errors never replay.
+		for {
+			err := p.playTrack(ctx, tr)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("playback error [%s]: %v", tr.Title, err)
+					p.notify(tr.ChannelID, fmt.Sprintf("⚠ Playback error for **%s**: %v", tr.Title, err))
+				}
+				break
+			}
+			if !p.looping.Load() {
+				break
+			}
 		}
 	}
 }

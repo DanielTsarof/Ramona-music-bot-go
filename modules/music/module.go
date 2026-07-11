@@ -107,6 +107,7 @@ func (m *MusicModule) Handlers() map[string]func(*events.ApplicationCommandInter
 		"pause":      m.handlePause,
 		"resume":     m.handleResume,
 		"skip":       m.handleSkip,
+		"loop":       m.handleLoop,
 		"stop":       m.handleStop,
 		"join":       m.handleJoin,
 		"leave":      m.handleLeave,

@@ -35,6 +35,7 @@ func (m *CommonModule) handleHelp(e *events.ApplicationCommandInteractionCreate)
 		"`/pause` — Pause playback\n" +
 		"`/resume` — Resume playback\n" +
 		"`/skip` — Skip the current track\n" +
+		"`/loop` — Toggle looping of the current track\n" +
 		"`/stop` — Stop and clear the queue\n" +
 		"`/join` — Join your voice channel\n" +
 		"`/leave` — Leave the voice channel\n" +
