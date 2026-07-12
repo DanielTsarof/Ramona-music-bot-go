@@ -31,7 +31,7 @@ func (m *CommonModule) handlePing(e *events.ApplicationCommandInteractionCreate)
 
 func (m *CommonModule) handleHelp(e *events.ApplicationCommandInteractionCreate) {
 	const msg = "**Music**\n" +
-		"`/play <query>` — Play a song (URL or search)\n" +
+		"`/play <query>` — Play a song (URL, search, or playlist URL)\n" +
 		"`/pause` — Pause playback\n" +
 		"`/resume` — Resume playback\n" +
 		"`/skip` — Skip the current track\n" +

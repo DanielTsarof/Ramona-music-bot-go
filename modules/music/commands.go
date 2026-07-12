@@ -53,6 +53,15 @@ func findUserVoiceChannel(e *events.ApplicationCommandInteractionCreate) (snowfl
 	return *vs.ChannelID, nil
 }
 
+// isPlaylistURL reports whether q is a YouTube playlist link. Any URL carrying
+// a list= parameter (including watch?v=…&list=…) enqueues the whole playlist.
+func isPlaylistURL(q string) bool {
+	if !strings.HasPrefix(q, "http://") && !strings.HasPrefix(q, "https://") {
+		return false
+	}
+	return strings.Contains(q, "list=") || strings.Contains(q, "/playlist")
+}
+
 func respond(e *events.ApplicationCommandInteractionCreate, msg string) {
 	_ = e.CreateMessage(discord.MessageCreate{Content: msg})
 }
@@ -115,6 +124,11 @@ func (m *MusicModule) handlePlay(e *events.ApplicationCommandInteractionCreate) 
 		}
 	}
 
+	if isPlaylistURL(query) {
+		m.enqueuePlaylist(e, p, query)
+		return
+	}
+
 	editResponse(e, fmt.Sprintf("Searching: **%s**…", query))
 	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer resolveCancel()
@@ -139,6 +153,48 @@ func (m *MusicModule) handlePlay(e *events.ApplicationCommandInteractionCreate) 
 	}
 
 	editResponse(e, fmt.Sprintf("Queued: **%s**", res.Title))
+}
+
+// enqueuePlaylist fetches the playlist entry list (one fast flat-playlist call)
+// and enqueues lazy tracks; stream URLs are resolved right before playback.
+func (m *MusicModule) enqueuePlaylist(e *events.ApplicationCommandInteractionCreate, p *Player, url string) {
+	editResponse(e, "Loading playlist…")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	title, entries, err := youtube.ResolvePlaylist(ctx, url, m.cfg.MaxQueueSize)
+	if err != nil {
+		editResponse(e, fmt.Sprintf("Could not load playlist: %v", err))
+		return
+	}
+
+	channelID := e.Channel().ID()
+	tracks := make([]Track, len(entries))
+	for i, entry := range entries {
+		tracks[i] = Track{
+			IsURL:      true,
+			Title:      entry.Title,
+			Query:      entry.WebpageURL,
+			ChannelID:  channelID,
+			WebpageURL: entry.WebpageURL,
+			Duration:   entry.Duration,
+		}
+	}
+
+	added := p.EnqueueAll(tracks)
+	if added == 0 {
+		editResponse(e, "Queue is full.")
+		return
+	}
+
+	if title == "" {
+		title = "playlist"
+	}
+	msg := fmt.Sprintf("Queued **%d** tracks from **%s**", added, title)
+	if added < len(entries) {
+		msg += fmt.Sprintf(" (%d skipped — queue is full)", len(entries)-added)
+	}
+	editResponse(e, msg)
 }
 
 func (m *MusicModule) handlePause(e *events.ApplicationCommandInteractionCreate) {

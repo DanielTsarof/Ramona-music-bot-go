@@ -4,7 +4,8 @@ A Discord music bot for YouTube playback, written in Go.
 
 ## Features
 
-- Play by URL or search query (`/play`), queue of up to `MAX_QUEUE_SIZE` tracks
+- Play by URL, search query, or a whole YouTube playlist link (`/play`), queue of
+  up to `MAX_QUEUE_SIZE` tracks
 - Interactive player panel, auto-posted when a track starts — buttons:
   ⏸/▶ pause, ⏭ skip, ↺ loop, ☰ queue, ⏹ stop
 - Loop the current track (`/loop` or the ↺ button)
@@ -18,7 +19,7 @@ A Discord music bot for YouTube playback, written in Go.
 
 | Command | Description |
 |---|---|
-| `/play <query>` | Play a track (URL or search) / add to the queue |
+| `/play <query>` | Play a track (URL or search) or enqueue a whole playlist (playlist URL) |
 | `/pause`, `/resume` | Pause / resume playback |
 | `/skip` | Skip the current track |
 | `/loop` | Toggle looping of the current track |

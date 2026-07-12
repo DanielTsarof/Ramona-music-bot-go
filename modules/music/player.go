@@ -199,6 +199,27 @@ func (p *Player) Enqueue(t Track) error {
 	return nil
 }
 
+// EnqueueAll appends tracks until the queue is full and returns how many fit.
+func (p *Player) EnqueueAll(tracks []Track) int {
+	p.mu.Lock()
+	space := p.maxSize - len(p.queue)
+	if space <= 0 {
+		p.mu.Unlock()
+		return 0
+	}
+	if len(tracks) > space {
+		tracks = tracks[:space]
+	}
+	p.queue = append(p.queue, tracks...)
+	p.mu.Unlock()
+
+	select {
+	case p.notifyCh <- struct{}{}:
+	default:
+	}
+	return len(tracks)
+}
+
 func (p *Player) dequeue() (Track, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -476,11 +497,25 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		time.Sleep(250 * time.Millisecond)
 	}()
 
+	// Lazy tracks (playlist entries) carry no stream URL — resolve now.
+	input := tr.Input
+	if input == "" && tr.Query != "" {
+		rctx, rcancel := context.WithTimeout(ctx, 60*time.Second)
+		res, rerr := youtube.Resolve(rctx, tr.Query)
+		rcancel()
+		if rerr != nil {
+			return fmt.Errorf("resolve: %w", rerr)
+		}
+		input = res.StreamURL
+	}
+	if input == "" {
+		return errors.New("track has no stream URL")
+	}
+
 	// Googlevideo URLs go stale (IP-locked, expiring) and the network can cut
 	// mid-track, so on a non-cancel failure re-resolve a fresh URL from the
 	// original query and resume from where playback stopped.
 	const maxRestarts = 2
-	input := tr.Input
 	var offset time.Duration
 	for restart := 0; ; restart++ {
 		played, err := p.streamOnce(ctx, conn, input, tr.IsURL, offset)

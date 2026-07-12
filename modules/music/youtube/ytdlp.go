@@ -40,6 +40,90 @@ func Resolve(ctx context.Context, query string) (Info, error) {
 	}
 }
 
+// ResolvePlaylist fetches up to limit playlist entries with one fast
+// --flat-playlist call (no per-video extraction). Returned Infos have an empty
+// StreamURL — the player resolves each entry lazily right before playback.
+func ResolvePlaylist(ctx context.Context, url string, limit int) (string, []Info, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	const attempts = 2
+	var (
+		title   string
+		entries []Info
+		err     error
+	)
+	for i := 1; ; i++ {
+		title, entries, err = resolvePlaylistOnce(ctx, url, limit)
+		if err == nil || i >= attempts || ctx.Err() != nil {
+			return title, entries, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func resolvePlaylistOnce(ctx context.Context, url string, limit int) (string, []Info, error) {
+	result, err := ytdlp.New().
+		FlatPlaylist().
+		PlaylistItems(fmt.Sprintf("1:%d", limit)).
+		ForceIPv4().
+		SocketTimeout(15).
+		Retries("3").
+		ExtractorRetries("3").
+		NoUpdate().
+		DumpJSON().
+		Run(ctx, url)
+	if err != nil {
+		return "", nil, fmt.Errorf("yt-dlp: %w", err)
+	}
+
+	infos, err := result.GetExtractedInfo()
+	if err != nil {
+		return "", nil, fmt.Errorf("parse yt-dlp output: %w", err)
+	}
+	if len(infos) == 0 {
+		return "", nil, fmt.Errorf("playlist is empty or unavailable")
+	}
+
+	var title string
+	if infos[0].PlaylistTitle != nil {
+		title = *infos[0].PlaylistTitle
+	}
+
+	entries := make([]Info, 0, len(infos))
+	for _, raw := range infos {
+		e := Info{}
+		if raw.Title != nil {
+			e.Title = *raw.Title
+		}
+		if e.Title == "" {
+			e.Title = raw.ID
+		}
+		if raw.Duration != nil {
+			e.Duration = int(*raw.Duration)
+		}
+		// Flat entries carry the video URL in URL; fall back to building one from the ID.
+		switch {
+		case raw.URL != nil && *raw.URL != "":
+			e.WebpageURL = *raw.URL
+		case raw.ID != "":
+			e.WebpageURL = "https://www.youtube.com/watch?v=" + raw.ID
+		default:
+			continue // no way to play this entry
+		}
+		entries = append(entries, e)
+	}
+	if len(entries) == 0 {
+		return "", nil, fmt.Errorf("playlist has no playable entries")
+	}
+	return title, entries, nil
+}
+
 func resolveOnce(ctx context.Context, input string) (Info, error) {
 	result, err := ytdlp.New().
 		NoPlaylist().
