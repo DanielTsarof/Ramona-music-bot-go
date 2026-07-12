@@ -2,3 +2,5 @@
 .env
 *.mp3
 *.json
+cookies.txt
+data/

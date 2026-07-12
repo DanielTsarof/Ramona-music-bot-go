@@ -9,6 +9,29 @@ import (
 	ytdlp "github.com/lrstanley/go-ytdlp"
 )
 
+// cookiesFile, when set, is passed to every yt-dlp invocation (--cookies).
+// Set once at startup before any Resolve call; not safe for concurrent writes.
+var cookiesFile string
+
+// SetCookiesFile enables passing a Netscape-format cookies.txt to yt-dlp.
+func SetCookiesFile(path string) {
+	cookiesFile = path
+}
+
+// newCommand returns the base yt-dlp command with the flags shared by all calls.
+func newCommand() *ytdlp.Command {
+	cmd := ytdlp.New().
+		ForceIPv4().
+		SocketTimeout(15).
+		Retries("3").
+		ExtractorRetries("3").
+		NoUpdate()
+	if cookiesFile != "" {
+		cmd = cmd.Cookies(cookiesFile)
+	}
+	return cmd
+}
+
 // Info describes a resolved track.
 type Info struct {
 	StreamURL  string
@@ -68,14 +91,9 @@ func ResolvePlaylist(ctx context.Context, url string, limit int) (string, []Info
 }
 
 func resolvePlaylistOnce(ctx context.Context, url string, limit int) (string, []Info, error) {
-	result, err := ytdlp.New().
+	result, err := newCommand().
 		FlatPlaylist().
 		PlaylistItems(fmt.Sprintf("1:%d", limit)).
-		ForceIPv4().
-		SocketTimeout(15).
-		Retries("3").
-		ExtractorRetries("3").
-		NoUpdate().
 		DumpJSON().
 		Run(ctx, url)
 	if err != nil {
@@ -125,14 +143,9 @@ func resolvePlaylistOnce(ctx context.Context, url string, limit int) (string, []
 }
 
 func resolveOnce(ctx context.Context, input string) (Info, error) {
-	result, err := ytdlp.New().
+	result, err := newCommand().
 		NoPlaylist().
 		Format("bestaudio[ext=webm]/bestaudio/best").
-		ForceIPv4().
-		SocketTimeout(15).
-		Retries("3").
-		ExtractorRetries("3").
-		NoUpdate().
 		DumpJSON().
 		Run(ctx, input)
 	if err != nil {

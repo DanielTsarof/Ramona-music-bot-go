@@ -11,6 +11,7 @@ import (
 	"RamonaGo/internal/config"
 	"RamonaGo/modules/common"
 	"RamonaGo/modules/music"
+	"RamonaGo/modules/music/youtube"
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/cache"
@@ -37,6 +38,10 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if cfg.YtdlpCookies != "" {
+		youtube.SetCookiesFile(cfg.YtdlpCookies)
+		log.Printf("yt-dlp cookies enabled: %s", cfg.YtdlpCookies)
 	}
 
 	var guildID snowflake.ID

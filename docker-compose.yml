@@ -7,6 +7,8 @@ services:
       - net.ipv6.conf.all.disable_ipv6=1
     volumes:
       - ytdlp-cache:/root/.cache/go-ytdlp
+      # rw: yt-dlp writes rotated YouTube cookies back to the file
+      - ./data:/data
 
 volumes:
   ytdlp-cache:

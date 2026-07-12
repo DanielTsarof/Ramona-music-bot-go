@@ -37,6 +37,7 @@ DISCORD_TOKEN=your_bot_token        # required
 DISCORD_GUILD_ID=                   # guild ID for instant command sync (empty = global, up to 1 h)
 MAX_QUEUE_SIZE=50                   # maximum queue size
 IDLE_DISCONNECT_SECONDS=300         # idle disconnect timeout, 0 = disabled
+YTDLP_COOKIES=/data/cookies.txt     # optional: YouTube cookies for yt-dlp (empty = off)
 ```
 
 2. Build and run:
@@ -51,6 +52,21 @@ volume (it self-updates to the latest version on every startup).
 The image is multi-arch (`amd64`/`arm64`): it also builds and runs on a
 Raspberry Pi 4 with 64-bit Raspberry Pi OS — run the same command on the Pi.
 32-bit OS (armv7) is not supported (no libdave build for it).
+
+### YouTube cookies (optional)
+
+Cookies help against "Sign in to confirm you're not a bot", age-restricted
+videos and throttling. Export them from a logged-in browser into
+Netscape format:
+
+```sh
+yt-dlp --cookies-from-browser firefox --cookies data/cookies.txt -s "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Put the file at `./data/cookies.txt` (the `data/` directory is mounted into the
+container read-write — yt-dlp rewrites rotated cookies) and set
+`YTDLP_COOKIES=/data/cookies.txt` in `.env`. Never commit this file — it is
+your account session (`data/` is gitignored).
 
 ## Stack
 
