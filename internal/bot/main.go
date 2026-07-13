@@ -29,11 +29,23 @@ func main() {
 	if _, err := ytdlp.Install(context.Background(), &ytdlp.InstallOptions{AllowVersionMismatch: true}); err != nil {
 		log.Fatalf("yt-dlp install: %v", err)
 	}
-	updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	if _, err := ytdlp.New().UpdateTo(updateCtx, "stable@latest"); err != nil {
-		log.Printf("WARN yt-dlp self-update failed (continuing with cached binary): %v", err)
-	}
-	updateCancel()
+	// Self-update in the background with retries: on some hosts (RPi) DNS is
+	// not reliable in the first seconds after container start, and the update
+	// must not delay or block bot startup anyway.
+	go func() {
+		for attempt := 1; attempt <= 3; attempt++ {
+			updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			_, err := ytdlp.New().UpdateTo(updateCtx, "stable@latest")
+			updateCancel()
+			if err == nil {
+				log.Println("yt-dlp self-update finished")
+				return
+			}
+			log.Printf("WARN yt-dlp self-update attempt %d/3 failed: %v", attempt, err)
+			time.Sleep(30 * time.Second)
+		}
+		log.Println("WARN yt-dlp self-update gave up; continuing with cached binary")
+	}()
 
 	cfg, err := config.Load()
 	if err != nil {
