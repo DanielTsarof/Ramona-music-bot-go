@@ -34,8 +34,30 @@ func NewMusicModule(client *bot.Client, cfg *config.Config, ctx context.Context)
 	client.AddEventListeners(
 		bot.NewListenerFunc(m.onVoiceStateUpdate),
 		bot.NewListenerFunc(m.onComponentInteraction),
+		bot.NewListenerFunc(m.onReady),
 	)
 	return m
+}
+
+// onReady also fires when the gateway re-identifies after an invalid session.
+// Voice does not survive that: Discord silently drops the bot from voice and
+// the removal event is lost in the gap, leaving a conn that still looks Ready
+// while every frame goes into the void. Drop such sessions; the next /play
+// does a clean join. On first startup no player is connected, so it's a no-op.
+func (m *MusicModule) onReady(_ *events.Ready) {
+	m.mu.Lock()
+	players := make([]*Player, 0, len(m.players))
+	for _, p := range m.players {
+		players = append(players, p)
+	}
+	m.mu.Unlock()
+
+	for _, p := range players {
+		if p.Connected() {
+			log.Printf("guild %s: gateway re-identified, resetting stale voice session", p.guildID)
+			p.ResetVoiceState()
+		}
+	}
 }
 
 // onComponentInteraction handles clicks on the player panel buttons.

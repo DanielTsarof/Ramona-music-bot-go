@@ -77,13 +77,21 @@ func (p *Player) Join(channelID snowflake.ID) error {
 	// This handles the case where sendWithReconnect just finished a successful join
 	// and a concurrent handlePlay call arrives.
 	if existing := p.client.VoiceManager.GetConn(p.guildID); existing != nil {
-		if existing.Gateway().Status() == voice.StatusReady {
+		// StatusReady alone can lie: after a main-gateway re-identify the bot
+		// is dropped from voice server-side and the removal event is lost in
+		// the gap, leaving a zombie conn. The voice-state cache is rebuilt
+		// fresh on re-identify, so require it to agree we are in a channel.
+		vs, inVoice := p.client.Caches.VoiceState(p.guildID, p.client.ID())
+		if existing.Gateway().Status() == voice.StatusReady && inVoice && vs.ChannelID != nil {
 			p.mu.Lock()
 			p.conn = existing
 			p.channelID = channelID
 			p.mu.Unlock()
 			return nil
 		}
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		safeConnClose(existing, closeCtx)
+		closeCancel()
 		p.client.VoiceManager.RemoveConn(p.guildID)
 	}
 
@@ -151,13 +159,23 @@ func (p *Player) VoiceChannelID() snowflake.ID {
 }
 
 // ResetVoiceState drops local voice state and clears the queue. Used when the
-// bot was removed from the channel externally (kick/move) and the conn is dead.
+// bot was removed from the channel externally (kick/move/session invalidation)
+// and the conn can no longer be trusted. The conn is closed and removed from
+// the VoiceManager so Join's reuse fast path cannot resurrect it.
 func (p *Player) ResetVoiceState() {
 	p.Stop()
 	p.mu.Lock()
+	conn := p.conn
 	p.conn = nil
 	p.channelID = 0
 	p.mu.Unlock()
+
+	if conn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		safeConnClose(conn, ctx)
+		cancel()
+	}
+	p.client.VoiceManager.RemoveConn(p.guildID)
 }
 
 func (p *Player) Disconnect() error {
@@ -433,6 +451,44 @@ func (p *Player) notify(channelID snowflake.ID, msg string) {
 	}
 }
 
+const (
+	// daveReadyTimeout bounds how long playback waits for the DAVE E2EE epoch
+	// after joining. Passthrough (non-E2EE) sessions never report ready, so
+	// hitting the timeout just starts playback as before, it is not an error.
+	daveReadyTimeout = 15 * time.Second
+	// daveDesyncTimeout is how long an established E2EE session may stay
+	// not-ready mid-track before the voice session is rebuilt.
+	daveDesyncTimeout = 10 * time.Second
+	// daveCheckInterval is how often (in 20 ms frames) the sender samples
+	// DAVE readiness: 50 frames = once per second.
+	daveCheckInterval = 50
+)
+
+// errDaveDesync signals that the DAVE session lost its E2EE key mid-track:
+// UDP writes keep "succeeding" but listeners cannot decrypt the frames, so
+// the only observable symptom is silence. The voice session must be rebuilt.
+var errDaveDesync = errors.New("DAVE E2EE session lost readiness")
+
+// waitDaveReady blocks until the conn's DAVE session has an established E2EE
+// epoch, ctx is cancelled, or the timeout passes. Frames sent before the
+// epoch is established are encrypted with no/stale key and silently dropped
+// by listeners, which is why playback holds for this.
+func waitDaveReady(ctx context.Context, conn voice.Conn, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		if conn.DAVE().Ready() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // announceSpeaking sends SetSpeaking with retries; the conn is fully open by
 // the time this is called, so failures should be rare and transient.
 func announceSpeaking(ctx context.Context, conn voice.Conn) error {
@@ -497,6 +553,16 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		time.Sleep(250 * time.Millisecond)
 	}()
 
+	// Hold audio until the DAVE E2EE epoch is established; see waitDaveReady.
+	if waitDaveReady(ctx, conn, daveReadyTimeout) {
+		log.Printf("guild %s: DAVE E2EE ready", p.guildID)
+	} else {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		log.Printf("guild %s: DAVE not ready after %s, playing anyway (non-E2EE session?)", p.guildID, daveReadyTimeout)
+	}
+
 	// Lazy tracks (playlist entries) carry no stream URL — resolve now.
 	input := tr.Input
 	if input == "" && tr.Query != "" {
@@ -526,7 +592,23 @@ func (p *Player) playTrack(parent context.Context, tr Track) error {
 		log.Printf("stream interrupted at %s [%s], restart %d/%d: %v",
 			offset.Round(time.Second), tr.Title, restart+1, maxRestarts, err)
 
-		if tr.Query != "" && tr.IsURL {
+		if errors.Is(err, errDaveDesync) {
+			// The stream URL is fine — the E2EE session is broken. Only a
+			// brand-new voice session (fresh gateway + MLS group) heals it.
+			log.Printf("guild %s: DAVE desync, rebuilding voice session", p.guildID)
+			newConn, jerr := p.rejoin()
+			if jerr != nil {
+				return fmt.Errorf("rejoin after DAVE desync: %w", jerr)
+			}
+			conn = newConn
+			if serr := announceSpeaking(ctx, conn); serr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("SetSpeaking after rejoin: %w", serr)
+			}
+			waitDaveReady(ctx, conn, daveReadyTimeout)
+		} else if tr.Query != "" && tr.IsURL {
 			rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
 			if res, rerr := youtube.Resolve(rctx, tr.Query); rerr == nil {
 				input = res.StreamURL
@@ -602,8 +684,29 @@ PREBUFFER:
 	framesSent := 0
 	lastFrameSent := time.Now().UnixMilli()
 
+	// DAVE watchdog state: once E2EE was seen established, losing it for
+	// daveDesyncTimeout means listeners hear silence while every UDP write
+	// still "succeeds" — the only way to notice is to ask the session.
+	var (
+		daveWasReady      bool
+		daveNotReadySince time.Time
+	)
+
 SENDLOOP:
 	for pkt := range frameCh {
+		if framesSent%daveCheckInterval == 0 {
+			if conn.DAVE().Ready() {
+				daveWasReady = true
+				daveNotReadySince = time.Time{}
+			} else if daveWasReady {
+				if daveNotReadySince.IsZero() {
+					daveNotReadySince = time.Now()
+				} else if time.Since(daveNotReadySince) > daveDesyncTimeout {
+					sendErr = errDaveDesync
+					break SENDLOOP
+				}
+			}
+		}
 		if p.paused.Load() {
 			// Silence frames let the receiving decoder settle instead of
 			// interpolating into a click.
@@ -711,15 +814,46 @@ func safeConnClose(conn voice.Conn, ctx context.Context) {
 
 const voiceReconnectAttempts = 3
 
-// sendWithReconnect sends pkt to Discord; on failure it performs a full
-// session recreate (Join) up to voiceReconnectAttempts times. Using
-// conn.Open() on the existing conn is not sufficient after a 4006 "Session is
-// no longer valid" — a brand-new conn must be created each attempt.
+// rejoin tears down the current voice session and builds a brand-new one to
+// the same channel: fresh voice gateway, fresh UDP socket and — crucially —
+// a fresh DAVE/MLS session. conn.Open() on the existing conn is not
+// sufficient after a 4006 "Session is no longer valid" or an MLS desync.
+func (p *Player) rejoin() (voice.Conn, error) {
+	p.mu.Lock()
+	old := p.conn
+	channelID := p.channelID
+	p.conn = nil
+	p.mu.Unlock()
+
+	if channelID == 0 {
+		return nil, errors.New("no voice channel to rejoin")
+	}
+
+	if old != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		safeConnClose(old, closeCtx)
+		closeCancel()
+	}
+	// Close normally removes the conn from the VoiceManager; make sure of it
+	// so Join's reuse fast path cannot pick the dead conn back up.
+	p.client.VoiceManager.RemoveConn(p.guildID)
+
+	if err := p.Join(channelID); err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	conn := p.conn
+	p.mu.Unlock()
+	return conn, nil
+}
+
+// sendWithReconnect sends pkt to Discord; on failure it rebuilds the voice
+// session (rejoin) up to voiceReconnectAttempts times.
 // On final failure p.conn is left nil so the next /play triggers a fresh join.
 func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 	p.mu.Lock()
 	conn := p.conn
-	channelID := p.channelID
 	p.mu.Unlock()
 
 	if err := safeUDPWrite(conn, pkt); err == nil {
@@ -731,12 +865,6 @@ func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 
 	log.Println("voice write error, attempting full reconnect...")
 
-	// Null out p.conn immediately. If all attempts fail it stays nil, so
-	// p.Connected() returns false and the next /play triggers a clean join.
-	p.mu.Lock()
-	p.conn = nil
-	p.mu.Unlock()
-
 	for i := 1; i <= voiceReconnectAttempts; i++ {
 		select {
 		case <-ctx.Done():
@@ -744,27 +872,18 @@ func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 		default:
 		}
 
-		if err := p.Join(channelID); err != nil {
+		if newConn, err := p.rejoin(); err != nil {
 			log.Printf("voice reconnect attempt %d/%d: %v", i, voiceReconnectAttempts, err)
 		} else {
-			p.mu.Lock()
-			conn = p.conn
-			p.mu.Unlock()
-
 			// Re-announce speaking on the fresh connection.
-			if err := announceSpeaking(ctx, conn); err != nil && ctx.Err() != nil {
+			if err := announceSpeaking(ctx, newConn); err != nil && ctx.Err() != nil {
 				return ctx.Err()
 			}
 
-			if err := safeUDPWrite(conn, pkt); err == nil {
+			if err := safeUDPWrite(newConn, pkt); err == nil {
 				log.Printf("voice reconnected (attempt %d/%d)", i, voiceReconnectAttempts)
 				return nil
 			}
-
-			// Write still failing; discard this session before the next attempt.
-			p.mu.Lock()
-			p.conn = nil
-			p.mu.Unlock()
 		}
 
 		if i < voiceReconnectAttempts {
@@ -776,8 +895,17 @@ func (p *Player) sendWithReconnect(ctx context.Context, pkt []byte) error {
 		}
 	}
 
-	// All attempts failed. Clean up VoiceManager so the next Join() creates a
-	// fresh conn rather than reusing this dead one.
+	// All attempts failed. Leave p.conn nil and the VoiceManager clean so the
+	// next /play creates a fresh conn rather than reusing a dead one.
+	p.mu.Lock()
+	dead := p.conn
+	p.conn = nil
+	p.mu.Unlock()
+	if dead != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		safeConnClose(dead, closeCtx)
+		closeCancel()
+	}
 	p.client.VoiceManager.RemoveConn(p.guildID)
 	return fmt.Errorf("voice reconnect failed after %d attempts", voiceReconnectAttempts)
 }
